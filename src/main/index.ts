@@ -1567,7 +1567,7 @@ function buildMenu(): void {
         {
           label: "Hermes Agent on GitHub",
           click: (): void => {
-            openExternalUrl("https://github.com/NousResearch/hermes-agent/");
+            openExternalUrl("https://github.com/wesleysimplicio/hermes-turbo-agent/");
           },
         },
         {

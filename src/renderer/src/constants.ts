@@ -865,11 +865,17 @@ export const GATEWAY_PLATFORMS: PlatformDef[] = [
 
 // ── Install ─────────────────────────────────────────────
 
-export const UNIX_INSTALL_CMD =
-  "curl -fsSL https://raw.githubusercontent.com/NousResearch/hermes-agent/main/scripts/install.sh | bash";
+// Hermes Turbo agent backend. The fork's install scripts still clone the
+// upstream repo (hardcoded, no override flag), so the manual fallback commands
+// rewrite the clone slug to the fork and pin the branch + ~/.hermes-turbo data
+// dir — mirroring what the desktop's automated installer does.
+export const HERMES_AGENT_REPO = "wesleysimplicio/hermes-turbo-agent";
+export const HERMES_AGENT_BRANCH = "codex/hermes-agent-100x-fast";
+const UPSTREAM_AGENT_REPO = "NousResearch/hermes-agent";
+
+export const UNIX_INSTALL_CMD = `curl -fsSL https://raw.githubusercontent.com/${HERMES_AGENT_REPO}/${HERMES_AGENT_BRANCH}/scripts/install.sh | sed 's#${UPSTREAM_AGENT_REPO}#${HERMES_AGENT_REPO}#g' | bash -s -- --branch ${HERMES_AGENT_BRANCH} --hermes-home "$HOME/.hermes-turbo" --dir "$HOME/.hermes-turbo/hermes-agent"`;
 export const INSTALL_CMD_UNIX = UNIX_INSTALL_CMD;
-export const WINDOWS_INSTALL_CMD =
-  "powershell -NoProfile -ExecutionPolicy Bypass -c \"$hermesHome = Join-Path $env:USERPROFILE '.hermes'; $installDir = Join-Path $hermesHome 'hermes-agent'; $installer = [ScriptBlock]::Create((irm https://raw.githubusercontent.com/NousResearch/hermes-agent/main/scripts/install.ps1 -UseBasicParsing)); & $installer -SkipSetup -HermesHome $hermesHome -InstallDir $installDir\"";
+export const WINDOWS_INSTALL_CMD = `powershell -NoProfile -ExecutionPolicy Bypass -c "$hermesHome = Join-Path $env:USERPROFILE '.hermes-turbo'; $installDir = Join-Path $hermesHome 'hermes-agent'; $src = (irm https://raw.githubusercontent.com/${HERMES_AGENT_REPO}/${HERMES_AGENT_BRANCH}/scripts/install.ps1 -UseBasicParsing); $src = $src -replace '${UPSTREAM_AGENT_REPO}','${HERMES_AGENT_REPO}'; $installer = [ScriptBlock]::Create($src); & $installer -SkipSetup -Branch '${HERMES_AGENT_BRANCH}' -HermesHome $hermesHome -InstallDir $installDir"`;
 export const INSTALL_CMD =
   typeof window !== "undefined" &&
   window.electron?.process?.platform === "win32"
