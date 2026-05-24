@@ -23,6 +23,21 @@ import { HIDDEN_SUBPROCESS_OPTIONS } from "./process-options";
 
 const IS_WINDOWS = process.platform === "win32";
 
+// ── Hermes agent backend source ──────────────────────────────────────────────
+// The desktop installs and drives this agent. Swapped from the upstream
+// NousResearch/hermes-agent to the Hermes Turbo fork.
+export const HERMES_AGENT_REPO = "wesleysimplicio/hermes-turbo-agent";
+export const HERMES_AGENT_BRANCH = "codex/hermes-agent-100x-fast";
+// The fork's install scripts still hardcode the upstream clone URL and expose
+// no repo-override flag, so the desktop rewrites this slug → the fork slug in
+// the downloaded script before running it.
+export const UPSTREAM_AGENT_REPO = "NousResearch/hermes-agent";
+export const HERMES_INSTALL_SH_URL = `https://raw.githubusercontent.com/${HERMES_AGENT_REPO}/${HERMES_AGENT_BRANCH}/scripts/install.sh`;
+export const HERMES_INSTALL_PS1_URL = `https://raw.githubusercontent.com/${HERMES_AGENT_REPO}/${HERMES_AGENT_BRANCH}/scripts/install.ps1`;
+// POSIX dotdir / Windows %LOCALAPPDATA% subdir for the agent's data home.
+const HERMES_HOME_DOTDIR = ".hermes-turbo";
+const HERMES_HOME_WIN_DIRNAME = "hermes-turbo";
+
 // Resolve the Hermes data directory. Precedence:
 //   1. HERMES_HOME env var if set (install.ps1 sets it User-scope on
 //      Windows; users may also override manually for WSL/custom setups).
@@ -50,11 +65,11 @@ function looksLikeHermesHome(dir: string): boolean {
 }
 
 function defaultHermesHome(): string {
-  const homeDot = join(homedir(), ".hermes");
+  const homeDot = join(homedir(), HERMES_HOME_DOTDIR);
   if (!IS_WINDOWS) return homeDot;
 
   const localApp = process.env.LOCALAPPDATA
-    ? join(process.env.LOCALAPPDATA, "hermes")
+    ? join(process.env.LOCALAPPDATA, HERMES_HOME_WIN_DIRNAME)
     : null;
 
   // Prefer whichever location already has hermes data.
@@ -893,9 +908,18 @@ export async function runInstall(
       // then run the official install script. Electron apps launched from Finder
       // don't inherit the terminal environment.
       const shellProfile = getShellProfile(home);
+      // The fork's install.sh clones the upstream repo (hardcoded URL, no
+      // override flag), so download it, rewrite the clone slug to the fork,
+      // then run it pinned to our branch and data dir. `--hermes-home`/`--dir`
+      // force the install to land where the desktop's HERMES_HOME constant
+      // expects it (~/.hermes-turbo), independent of the script's own default.
       const installCmd = [
+        "set -o pipefail;",
         shellProfile ? `source "${shellProfile}" 2>/dev/null;` : "",
-        "curl -fsSL https://raw.githubusercontent.com/NousResearch/hermes-agent/main/scripts/install.sh | bash -s -- --skip-setup",
+        `script="$(mktemp)";`,
+        `curl -fsSL "${HERMES_INSTALL_SH_URL}" | sed 's#${UPSTREAM_AGENT_REPO}#${HERMES_AGENT_REPO}#g' > "$script" &&`,
+        `bash "$script" --skip-setup --branch "${HERMES_AGENT_BRANCH}" --hermes-home "${HERMES_HOME}" --dir "${HERMES_REPO}";`,
+        `code=$?; rm -f "$script"; exit $code`,
       ].join(" ");
 
       const basePath = getEnhancedPath();
@@ -998,7 +1022,7 @@ async function runInstallWindows(emit: (t: string) => void): Promise<void> {
     // Force TLS 1.2 for older Windows PowerShell 5.1 hosts that still default
     // to TLS 1.0 — github raw refuses TLS < 1.2.
     "try { [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12 } catch {}",
-    "$url = 'https://raw.githubusercontent.com/NousResearch/hermes-agent/main/scripts/install.ps1'",
+    `$url = ${psQuote(HERMES_INSTALL_PS1_URL)}`,
     `$installer = Join-Path $env:TEMP ("hermes-install-script-" + [guid]::NewGuid().ToString() + ".ps1")`,
     // Windows PowerShell 5.1 parses BOM-less files as the legacy ANSI codepage,
     // which mangles the non-ASCII glyphs in install.ps1 and produces parse
@@ -1007,8 +1031,11 @@ async function runInstallWindows(emit: (t: string) => void): Promise<void> {
     "$resp = Invoke-WebRequest -Uri $url -UseBasicParsing",
     "$text = if ($resp.Content -is [byte[]]) { [System.Text.Encoding]::UTF8.GetString($resp.Content) } else { [string]$resp.Content }",
     "if ($text.Length -gt 0 -and $text[0] -eq [char]0xFEFF) { $text = $text.Substring(1) }",
+    // The fork's install.ps1 clones the upstream repo (hardcoded, no override),
+    // so rewrite the clone slug to the fork before running it.
+    `$text = $text -replace ${psQuote(UPSTREAM_AGENT_REPO)}, ${psQuote(HERMES_AGENT_REPO)}`,
     "[System.IO.File]::WriteAllText($installer, $text, (New-Object System.Text.UTF8Encoding $true))",
-    `& $installer -SkipSetup -HermesHome ${psQuote(hermesHome)} -InstallDir ${psQuote(installDir)}`,
+    `& $installer -SkipSetup -Branch ${psQuote(HERMES_AGENT_BRANCH)} -HermesHome ${psQuote(hermesHome)} -InstallDir ${psQuote(installDir)}`,
     "$exit = $LASTEXITCODE",
     "Remove-Item -Force -ErrorAction SilentlyContinue $installer",
     "exit $exit",
@@ -1080,7 +1107,7 @@ async function runInstallWindows(emit: (t: string) => void): Promise<void> {
       } else {
         reject(
           new Error(
-            `Installation failed (exit code ${code}). Open PowerShell and try: irm https://raw.githubusercontent.com/NousResearch/hermes-agent/main/scripts/install.ps1 | iex`,
+            `Installation failed (exit code ${code}). Open PowerShell and try: irm ${HERMES_INSTALL_PS1_URL} | iex`,
           ),
         );
       }
