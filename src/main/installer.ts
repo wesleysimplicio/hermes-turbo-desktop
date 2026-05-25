@@ -833,6 +833,66 @@ const STAGE_MARKERS: { pattern: RegExp; step: number; title: string }[] = [
   },
 ];
 
+/**
+ * Build the `bash -c` command that installs the Hermes Turbo agent on
+ * POSIX systems. The fork's install.sh clones the upstream repo (hardcoded
+ * URL, no override flag), so we download it, rewrite the clone slug to the
+ * fork, then run it pinned to our branch and data dir. `--hermes-home`/`--dir`
+ * force the install to land where the desktop's HERMES_HOME constant expects
+ * it (~/.hermes-turbo), independent of the script's own default. Exported for
+ * unit testing.
+ */
+export function buildUnixInstallCommand(opts: {
+  shellProfile: string | null;
+  hermesHome: string;
+  hermesRepo: string;
+}): string {
+  return [
+    "set -o pipefail;",
+    opts.shellProfile ? `source "${opts.shellProfile}" 2>/dev/null;` : "",
+    `script="$(mktemp)";`,
+    `curl -fsSL "${HERMES_INSTALL_SH_URL}" | sed 's#${UPSTREAM_AGENT_REPO}#${HERMES_AGENT_REPO}#g' > "$script" &&`,
+    `bash "$script" --skip-setup --branch "${HERMES_AGENT_BRANCH}" --hermes-home "${opts.hermesHome}" --dir "${opts.hermesRepo}";`,
+    `code=$?; rm -f "$script"; exit $code`,
+  ].join(" ");
+}
+
+/**
+ * Build the wrapper .ps1 contents that installs the Hermes Turbo agent on
+ * Windows. The wrapper downloads install.ps1, rewrites the hardcoded upstream
+ * clone slug to the fork, then invokes it with our parameters — sidestepping
+ * the `iex`-can't-pass-args limitation. Exported for unit testing.
+ */
+export function buildWindowsInstallWrapperScript(opts: {
+  hermesHome: string;
+  installDir: string;
+}): string {
+  return [
+    "$ErrorActionPreference = 'Stop'",
+    // Force TLS 1.2 for older Windows PowerShell 5.1 hosts that still default
+    // to TLS 1.0 — github raw refuses TLS < 1.2.
+    "try { [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12 } catch {}",
+    `$url = ${psQuote(HERMES_INSTALL_PS1_URL)}`,
+    `$installer = Join-Path $env:TEMP ("hermes-install-script-" + [guid]::NewGuid().ToString() + ".ps1")`,
+    // Windows PowerShell 5.1 parses BOM-less files as the legacy ANSI codepage,
+    // which mangles the non-ASCII glyphs in install.ps1 and produces parse
+    // errors (see issue #149). Re-save with a UTF-8 BOM so PS 5.1 reads it as
+    // UTF-8. Idempotent if upstream later adds its own BOM or switches to ASCII.
+    "$resp = Invoke-WebRequest -Uri $url -UseBasicParsing",
+    "$text = if ($resp.Content -is [byte[]]) { [System.Text.Encoding]::UTF8.GetString($resp.Content) } else { [string]$resp.Content }",
+    "if ($text.Length -gt 0 -and $text[0] -eq [char]0xFEFF) { $text = $text.Substring(1) }",
+    // The fork's install.ps1 clones the upstream repo (hardcoded, no override),
+    // so rewrite the clone slug to the fork before running it.
+    `$text = $text -replace ${psQuote(UPSTREAM_AGENT_REPO)}, ${psQuote(HERMES_AGENT_REPO)}`,
+    "[System.IO.File]::WriteAllText($installer, $text, (New-Object System.Text.UTF8Encoding $true))",
+    `& $installer -SkipSetup -Branch ${psQuote(HERMES_AGENT_BRANCH)} -HermesHome ${psQuote(opts.hermesHome)} -InstallDir ${psQuote(opts.installDir)}`,
+    "$exit = $LASTEXITCODE",
+    "Remove-Item -Force -ErrorAction SilentlyContinue $installer",
+    "exit $exit",
+    "",
+  ].join("\r\n");
+}
+
 export async function runInstall(
   onProgress: (progress: InstallProgress) => void,
   parentWindow?: BrowserWindow | null,
@@ -908,19 +968,11 @@ export async function runInstall(
       // then run the official install script. Electron apps launched from Finder
       // don't inherit the terminal environment.
       const shellProfile = getShellProfile(home);
-      // The fork's install.sh clones the upstream repo (hardcoded URL, no
-      // override flag), so download it, rewrite the clone slug to the fork,
-      // then run it pinned to our branch and data dir. `--hermes-home`/`--dir`
-      // force the install to land where the desktop's HERMES_HOME constant
-      // expects it (~/.hermes-turbo), independent of the script's own default.
-      const installCmd = [
-        "set -o pipefail;",
-        shellProfile ? `source "${shellProfile}" 2>/dev/null;` : "",
-        `script="$(mktemp)";`,
-        `curl -fsSL "${HERMES_INSTALL_SH_URL}" | sed 's#${UPSTREAM_AGENT_REPO}#${HERMES_AGENT_REPO}#g' > "$script" &&`,
-        `bash "$script" --skip-setup --branch "${HERMES_AGENT_BRANCH}" --hermes-home "${HERMES_HOME}" --dir "${HERMES_REPO}";`,
-        `code=$?; rm -f "$script"; exit $code`,
-      ].join(" ");
+      const installCmd = buildUnixInstallCommand({
+        shellProfile,
+        hermesHome: HERMES_HOME,
+        hermesRepo: HERMES_REPO,
+      });
 
       const basePath = getEnhancedPath();
       const proc = spawn("bash", ["-c", installCmd], {
@@ -1003,44 +1055,20 @@ function resolvePowerShellExe(): string {
 
 async function runInstallWindows(emit: (t: string) => void): Promise<void> {
   // We can't `irm | iex` and pass parameters, and we want to override the
-  // upstream defaults (which install to %LOCALAPPDATA%\hermes) so the
-  // desktop app's HERMES_HOME == ~\.hermes convention keeps working.
-  // Strategy: write a small wrapper .ps1 to %TEMP%, run it with -File.
+  // install.ps1 defaults (which install to %LOCALAPPDATA%\hermes) so the
+  // desktop app's HERMES_HOME == %LOCALAPPDATA%\hermes-turbo convention keeps
+  // working. Strategy: write a small wrapper .ps1 to %TEMP%, run it with -File.
   const home = homedir();
-  const hermesHome = HERMES_HOME;
-  const installDir = HERMES_REPO;
 
   const wrapperPath = join(
     tmpdir(),
     `hermes-install-${randomBytes(6).toString("hex")}.ps1`,
   );
 
-  // The wrapper downloads install.ps1 to a sibling temp file and invokes it
-  // with our parameters. This sidesteps the `iex`-can't-pass-args limitation.
-  const wrapperScript = [
-    "$ErrorActionPreference = 'Stop'",
-    // Force TLS 1.2 for older Windows PowerShell 5.1 hosts that still default
-    // to TLS 1.0 — github raw refuses TLS < 1.2.
-    "try { [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12 } catch {}",
-    `$url = ${psQuote(HERMES_INSTALL_PS1_URL)}`,
-    `$installer = Join-Path $env:TEMP ("hermes-install-script-" + [guid]::NewGuid().ToString() + ".ps1")`,
-    // Windows PowerShell 5.1 parses BOM-less files as the legacy ANSI codepage,
-    // which mangles the non-ASCII glyphs in install.ps1 and produces parse
-    // errors (see issue #149). Re-save with a UTF-8 BOM so PS 5.1 reads it as
-    // UTF-8. Idempotent if upstream later adds its own BOM or switches to ASCII.
-    "$resp = Invoke-WebRequest -Uri $url -UseBasicParsing",
-    "$text = if ($resp.Content -is [byte[]]) { [System.Text.Encoding]::UTF8.GetString($resp.Content) } else { [string]$resp.Content }",
-    "if ($text.Length -gt 0 -and $text[0] -eq [char]0xFEFF) { $text = $text.Substring(1) }",
-    // The fork's install.ps1 clones the upstream repo (hardcoded, no override),
-    // so rewrite the clone slug to the fork before running it.
-    `$text = $text -replace ${psQuote(UPSTREAM_AGENT_REPO)}, ${psQuote(HERMES_AGENT_REPO)}`,
-    "[System.IO.File]::WriteAllText($installer, $text, (New-Object System.Text.UTF8Encoding $true))",
-    `& $installer -SkipSetup -Branch ${psQuote(HERMES_AGENT_BRANCH)} -HermesHome ${psQuote(hermesHome)} -InstallDir ${psQuote(installDir)}`,
-    "$exit = $LASTEXITCODE",
-    "Remove-Item -Force -ErrorAction SilentlyContinue $installer",
-    "exit $exit",
-    "",
-  ].join("\r\n");
+  const wrapperScript = buildWindowsInstallWrapperScript({
+    hermesHome: HERMES_HOME,
+    installDir: HERMES_REPO,
+  });
 
   try {
     writeFileSync(wrapperPath, wrapperScript, { encoding: "utf8" });
@@ -1069,7 +1097,7 @@ async function runInstallWindows(emit: (t: string) => void): Promise<void> {
         env: {
           ...process.env,
           PATH: basePath,
-          HERMES_HOME: hermesHome,
+          HERMES_HOME,
           // Hint that we're not interactive so install.ps1 doesn't `pause`
           // (the .cmd wrapper does on failure, but -File on .ps1 won't).
           NO_COLOR: "1",
