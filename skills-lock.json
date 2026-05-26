@@ -11,6 +11,11 @@
       "sourceType": "github",
       "computedHash": "b0bda72c70997b4b55db7d07e7297b806000e2527d40b80588c5f0a4774373b8"
     },
+    "superpowers": {
+      "source": "obra/superpowers",
+      "sourceType": "github",
+      "computedHash": "6866d008c29163e953c5d2aec5c9c31fd05b3596c004cdaa8fa5c2e5abd30bc6"
+    },
     "typescript-expert": {
       "source": "sickn33/antigravity-awesome-skills",
       "sourceType": "github",
